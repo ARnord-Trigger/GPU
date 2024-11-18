@@ -1,0 +1,110 @@
+#include<stdio.h>
+#include<stdlib.h>
+#define  N 1024*1024
+#define DATAMAX N*20
+
+_global_ void kernel1(int *b,int *a,int *c){
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+    if(idx<N){
+        c[idx]=a[idx]+b[idx];
+    }
+    
+}
+_global_ void kernel2(int *a,int *c){
+    _shared_ int shared_data[256];
+    int idx=threadIdx.x+blockIdx.x*blockDim.x;
+ if(idx<N){
+        c[threadIdx.x]=a[idx];
+    }
+else{
+     c[threadIdx.x]=-1;
+}
+__syncthreads();
+for(int i=256;i>0;i/=2){
+    if(threadIdx.x<i)
+    shared_data[threadIdx.x]=max(shared_data[threadIdx.x],shared_data[threadIdx.x]+i);
+}if(threadIdx.x==0){
+atomicMax(c,shared_data[threadIdx.x]);
+}
+    
+    }
+    
+
+
+    int main() {
+    cudaDeviceProp prop;
+    int Deviceid;
+    cudaGetDevice(&Deviceid);
+    cudaGetDeviceProperties(&prop, Deviceid);
+    if (!prop.deviceOverlap) {
+        printf("Device will not be able to handle overlaps\n");
+        return 0;
+    }
+
+    cudaEvent_t start, stop;
+    float elapsedTime;
+    int *host_a, *host_b, *host_c;
+    int *dev_a, *dev_b, *dev_c;
+    cudaStream_t stream1,stream2;
+    int* result;
+    // Create events and stream
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaStreamCreate(&stream1);cudaStreamCreate(&stream2);
+
+    // Allocate memory on the GPU
+    cudaMalloc((void**)&dev_a, N * sizeof(int));
+    cudaMalloc((void**)&dev_b, N * sizeof(int));
+    cudaMalloc((void**)&dev_c, N * sizeof(int));
+
+    // Allocate pinned memory on the host
+    cudaHostAlloc((void**)&host_a, DATAMAX * sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc((void**)&host_b, DATAMAX * sizeof(int), cudaHostAllocDefault);
+    cudaHostAlloc((void**)&host_c, DATAMAX * sizeof(int), cudaHostAllocDefault);
+
+    // Initialize input data
+    for (int i = 0; i < N; i++) {
+        host_a[i] = i ;
+        host_b[i] = 2 *i;
+}
+    // Start event recording
+    cudaEventRecord(start, 0);
+    int* dev_max;
+    // Process data in chunks
+    for (int i = 0; i < DATAMAX; i += N) {
+        // Copy memory from host to device asynchronously
+        cudaMemcpyAsync(dev_a, host_a + i, N * sizeof(int), cudaMemcpyHostToDevice, stream1);
+        cudaMemcpyAsync(dev_b, host_b + i, N * sizeof(int), cudaMemcpyHostToDevice, stream2);
+
+        // Launch the kernel
+        kernel1<<<N / 256, 256, 0, stream1>>>(dev_a, dev_b, dev_c); // Copy memory from device to host asynchronously
+        cudaMemcpyAsync(host_c + i, dev_c, N * sizeof(int), cudaMemcpyDeviceToHost, stream1);
+        kernel2<<<N / 256, 256, 0, stream2>>>(dev_a,dev_max);
+        cudaMemcpyAsync(result, dev_max, N * sizeof(int), cudaMemcpyDeviceToHost, stream2);
+    }
+
+    // Synchronize the stream
+cudaEventSynchronize(start);
+    cudaStreamSynchronize(stream1);
+    cudaStreamSynchronize(stream2);
+
+    // Stop event recording
+    cudaEventRecord(stop, 0);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+    printf("Total elapsed time: %f ms\n", elapsedTime);
+
+    // Print the maximum value found
+    printf("Max value in array: %d\n", *result);
+
+    // Clean up memory
+    cudaFreeHost(host_a);
+    cudaFreeHost(host_b);
+    cudaFreeHost(host_c);
+    cudaFree(dev_a);
+    cudaFree(dev_b);
+    cudaFree(dev_c);
+    cudaStreamDestroy(stream1);
+cudaStreamDestroy(stream2); return 0;
+
+}

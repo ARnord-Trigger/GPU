@@ -1,0 +1,417 @@
+//1. Vector Addition Kernel
+cpp
+Copy code
+__global__ void VecAddGPU(int *a, int *b, int *c, int N) {
+    int i = threadIdx.x;
+    if (i < N) {
+        c[i] = a[i] + b[i];
+    }
+}
+//2. Matrix Addition Kernel (Grid 1D Block 1D)
+cpp
+Copy code
+__global__ void sumMatrixOnGPU(float *MatA, float *MatB, float *MatC, int nx, int ny) {
+    unsigned int ix = threadIdx.x + blockIdx.x * blockDim.x;
+    if (ix < nx) {
+        for (int iy = 0; iy < ny; iy++) {
+            int idx = iy * nx + ix;
+            MatC[idx] = MatA[idx] + MatB[idx];
+        }
+    }
+}
+//3. Basic Matrix Multiplication Kernel
+cpp
+Copy code
+__global__ void MatrixMulKernel(float *MatA, float *MatB, float *MatC, int Width) {
+    int Row = blockIdx.y * blockDim.y + threadIdx.y;
+    int Col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (Row < Width && Col < Width) {
+        float Pvalue = 0;
+        for (int k = 0; k < Width; ++k) {
+            Pvalue += MatA[Row * Width + k] * MatB[k * Width + Col];
+        }
+        MatC[Row * Width + Col] = Pvalue;
+    }
+}
+//4. Tiled Matrix Multiplication Kernel
+cpp
+Copy code
+#define TILE_WIDTH 2
+
+__global__ void MatrixMulKernel(float *MatA, float *MatB, float *MatC, int Width) {
+    __shared__ float Mds[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float Nds[TILE_WIDTH][TILE_WIDTH];
+
+    int bx = blockIdx.x, by = blockIdx.y;
+    int tx = threadIdx.x, ty = threadIdx.y;
+    int Row = by * TILE_WIDTH + ty;
+    int Col = bx * TILE_WIDTH + tx;
+    float Pvalue = 0;
+
+    for (int ph = 0; ph < Width / TILE_WIDTH; ++ph) {
+        Mds[ty][tx] = MatA[Row * Width + ph * TILE_WIDTH + tx];
+        Nds[ty][tx] = MatB[(ph * TILE_WIDTH + ty) * Width + Col];
+        __syncthreads();
+
+        for (int k = 0; k < TILE_WIDTH; ++k) {
+            Pvalue += Mds[ty][k] * Nds[k][tx];
+        }
+        __syncthreads();
+    }
+
+    MatC[Row * Width + Col] = Pvalue;
+}
+//5. Reduction Sum Kernel
+cpp
+Copy code
+#define N 1000
+#define BD 256
+
+#define CHECK(call) {\
+    const cudaError_t error = call;\
+    if (error != cudaSuccess) {\
+        fprintf(stderr, "Error: %s:%d, ", __FILE__, __LINE__);\
+        fprintf(stderr, "code: %d, reason: %s\n", error, cudaGetErrorString(error));\
+        exit(1);\
+    }\
+}
+
+__global__ void sumReduce(float *dev_a, float *dev_b) {
+    __shared__ float partialSum[BD];
+    unsigned int t = threadIdx.x;
+    unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+
+    partialSum[t] = dev_a[i];
+    __syncthreads();
+
+    for (unsigned int stride = 1; stride < blockDim.x; stride *= 2) {
+        if (t % (2 * stride) == 0) {
+            partialSum[t] += partialSum[t + stride];
+        }
+        __syncthreads();
+    }
+
+    if (t == 0) {
+        dev_b[blockIdx.x] = partialSum[0];
+    }
+}
+
+
+//ANN
+__global__ void forward(float *input, float *w1, float *w2, float *z1, float *z2, 
+                       int input_size, int hidden_size, int output_size, int batch_size) {
+    int batch_idx = blockIdx.x;
+    int hidden_idx = threadIdx.x;
+    
+    if (hidden_idx < hidden_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < input_size; i++) {
+            sum += input[batch_idx * input_size + i] * w1[i * hidden_size + hidden_idx];
+        }
+        z1[batch_idx * hidden_size + hidden_idx] = fmaxf(0.0f, sum);
+    }
+    
+    __syncthreads(); 
+    
+    int output_idx = threadIdx.x;
+    if (output_idx < output_size) {
+        float sum = 0.0f;
+        for (int j = 0; j < hidden_size; j++) {
+            sum += z1[batch_idx * hidden_size + j] * w2[j * output_size + output_idx];
+        }
+        z2[batch_idx * output_size + output_idx] = sum;
+    }
+}
+
+__global__ void backprop(float *input, float *z1, float *z2, float *target, float *w1, float *w2,
+                        int input_size, int hidden_size, int output_size, int batch_size, float learning_rate) {
+    int batch_idx = blockIdx.x;
+    int output_idx = threadIdx.x;
+    
+    if (output_idx < output_size) {
+        float delta2 = z2[batch_idx * output_size + output_idx] - target[batch_idx * output_size + output_idx];
+        for (int j = 0; j < hidden_size; j++) {
+            atomicAdd(&w2[j * output_size + output_idx], 
+                     -learning_rate * delta2 * z1[batch_idx * hidden_size + j]);
+        }
+    }
+    
+    int hidden_idx = threadIdx.x;
+    if (hidden_idx < hidden_size) {
+        float delta1 = 0.0f;
+        for (int k = 0; k < output_size; k++) {
+            delta1 += (z2[batch_idx * output_size + k] - target[batch_idx * output_size + k]) 
+                     * w2[hidden_idx * output_size + k];
+        }
+        delta1 *= (z1[batch_idx * hidden_size + hidden_idx] > 0.0f) ? 1.0f : 0.0f;
+        
+        for (int i = 0; i < input_size; i++) {
+            atomicAdd(&w1[i * hidden_size + hidden_idx], 
+                     -learning_rate * delta1 * input[batch_idx * input_size + i]);
+        }
+    }
+}
+
+//CNN
+
+__global__ void conv2d(float *input, float *filters, float *output,
+                      int batch_size, int height, int width, int channels,
+                      int num_filters, int kernel_size, int output_height, int output_width) {
+    int batch_idx = blockIdx.x;
+    int filter_idx = blockIdx.y;
+    int out_y = threadIdx.x;
+    int out_x = threadIdx.y;
+    if (out_y < output_height && out_x < output_width) {
+        float sum = 0.0f;
+        
+        for (int c = 0; c < channels; c++) {
+            for (int ky = 0; ky < kernel_size; ky++) {
+                for (int kx = 0; kx < kernel_size; kx++) {
+                    int in_y = out_y + ky;
+                    int in_x = out_x + kx;
+                    
+                    if (in_y < height && in_x < width) {
+                        int input_idx = batch_idx * (height * width * channels) +
+                                      c * (height * width) +
+                                      in_y * width + in_x;
+                        int filter_idx_full = filter_idx * (channels * kernel_size * kernel_size) +
+                                            c * (kernel_size * kernel_size) +
+                                           ky * kernel_size + kx;
+                        
+                        sum += input[input_idx] * filters[filter_idx_full];
+                    }
+                }
+            }
+        }
+        
+        int output_idx = batch_idx * (num_filters * output_height * output_width) +
+                        filter_idx * (output_height * output_width) +
+                        out_y * output_width + out_x;
+        output[output_idx] = fmaxf(0.0f, sum); // ReLU activation
+    }
+}
+__global__ void max_pool2d(float *input, float *output,
+                          int batch_size, int height, int width, int channels,
+                          int pool_size, int output_height, int output_width) {
+    int batch_idx = blockIdx.x;
+    int channel = blockIdx.y;
+    int out_y = threadIdx.x;
+    int out_x = threadIdx.y;
+    
+    if (out_y < output_height && out_x < output_width) {
+        float max_val = -1e10f;
+        
+        for (int py = 0; py < pool_size; py++) {
+            for (int px = 0; px < pool_size; px++) {
+                int in_y = out_y * pool_size + py;
+                int in_x = out_x * pool_size + px;
+                
+                if (in_y < height && in_x < width) {
+                    int input_idx = batch_idx * (channels * height * width) +
+                                  channel * (height * width) +
+                                  in_y * width + in_x;
+                    max_val = fmaxf(max_val, input[input_idx]);
+                }
+            }
+        }
+        
+        int output_idx = batch_idx * (channels * output_height * output_width) +
+                        channel * (output_height * output_width) +
+                        out_y * output_width + out_x;
+        output[output_idx] = max_val;
+        }
+    }
+__global__ void fc_forward(float *input, float *weights, float *output,
+                          int batch_size, int input_size, int output_size) {
+    int batch_idx = blockIdx.x;
+    int neuron_idx = threadIdx.x;
+    
+    if (neuron_idx < output_size) {
+        float sum = 0.0f;
+        for (int i = 0; i < input_size; i++) {
+            sum += input[batch_idx * input_size + i] * weights[i * output_size + neuron_idx];
+        }
+        output[batch_idx * output_size + neuron_idx] = sum;
+    }
+}
+__global__ void conv2d_backward(float *d_output, float *filters, float *d_input,
+                               int batch_size, int height, int width, int channels,
+                               int num_filters, int kernel_size, int output_height, int output_width) {
+    int batch_idx = blockIdx.x;
+    int channel = blockIdx.y;
+    int in_y = threadIdx.x;
+    int in_x = threadIdx.y;
+    
+    if (in_y < height && in_x < width) {
+        float sum = 0.0f;
+        
+        for (int f = 0; f < num_filters; f++) {
+            for (int ky = 0; ky < kernel_size; ky++) {
+                for (int kx = 0; kx < kernel_size; kx++) {
+                    int out_y = in_y - ky;
+                    int out_x = in_x - kx;
+                    
+                    if (out_y >= 0 && out_y < output_height && out_x >= 0 && out_x < output_width) {
+                        int d_output_idx = batch_idx * (num_filters * output_height * output_width) +
+                                         f * (output_height * output_width) +
+                                         out_y * output_width + out_x;
+                        int filter_idx = f * (channels * kernel_size * kernel_size) +
+                                       channel * (kernel_size * kernel_size) +
+                                       ky * kernel_size + kx;
+                        
+                        sum += d_output[d_output_idx] * filters[filter_idx];
+                    }
+                }
+            }
+        }
+        
+        int d_input_idx = batch_idx * (channels * height * width) +
+                         channel * (height * width) +
+                         in_y * width + in_x;
+        d_input[d_input_idx] = sum;
+    }
+}
+__global__ void conv2d_update_weights(float *input, float *d_output, float *d_weights,
+                                    int batch_size, int height, int width, int channels,
+                                    int num_filters, int kernel_size, int output_height, int output_width) {
+    int filter_idx = blockIdx.x;
+    int ky = threadIdx.x;
+    int kx = threadIdx.y;
+    int c = blockIdx.y;
+    
+    if (ky < kernel_size && kx < kernel_size) {
+        float sum = 0.0f;
+        
+        for (int b = 0; b < batch_size; b++) {
+            for (int out_y = 0; out_y < output_height; out_y++) {
+                for (int out_x = 0; out_x < output_width; out_x++) {
+                    int in_y = out_y + ky;
+                    int in_x = out_x + kx;
+                    
+                    if (in_y < height && in_x < width) {
+                        int input_idx = b * (channels * height * width) +
+                                      c * (height * width) +
+                                      in_y * width + in_x;
+                        int d_output_idx = b * (num_filters * output_height * output_width) +
+                                         filter_idx * (output_height * output_width) +
+                                         out_y * output_width + out_x;
+                        
+                        sum += input[input_idx] * d_output[d_output_idx];
+                    }
+                }
+            }
+
+        }
+        
+        int weight_idx = filter_idx * (channels * kernel_size * kernel_size) +
+                        c * (kernel_size * kernel_size) +
+                        ky * kernel_size + kx;
+        d_weights[weight_idx] = sum / batch_size;
+    }
+}
+__global__ void max_pool_backward(float *input, float *d_output, float *d_input,
+                                int batch_size, int height, int width, int channels,
+                                int pool_size, int output_height, int output_width) {
+    int batch_idx = blockIdx.x;
+    int channel = blockIdx.y;
+    int in_y = threadIdx.x;
+    int in_x = threadIdx.y;
+    
+    if (in_y < height && in_x < width) {
+        int out_y = in_y / pool_size;
+        int out_x = in_x / pool_size;
+        
+        if (out_y < output_height && out_x < output_width) {
+            int input_idx = batch_idx * (channels * height * width) +
+                           channel * (height * width) +
+                           in_y * width + in_x;
+            int output_idx = batch_idx * (channels * output_height * output_width) +
+                           channel * (output_height * output_width) +
+                           out_y * output_width + out_x;
+           float input_val = input[input_idx];
+            float max_val = -1e10f;
+            int max_idx_y = -1, max_idx_x = -1;
+            
+            for (int py = 0; py < pool_size; py++) {
+                for (int px = 0; px < pool_size; px++) {
+                    int curr_y = out_y * pool_size + py;
+                    int curr_x = out_x * pool_size + px;
+                    
+                    if (curr_y < height && curr_x < width) {
+                        int curr_idx = batch_idx * (channels * height * width) +
+                                     channel * (height * width) +
+                                     curr_y * width + curr_x;
+                        float curr_val = input[curr_idx];
+                        
+                        if (curr_val > max_val) {
+                            max_val = curr_val;
+                            max_idx_y = curr_y;
+                            max_idx_x = curr_x;
+                        }
+                    }
+                }
+            }
+
+            if (in_y == max_idx_y && in_x == max_idx_x) {
+                d_input[input_idx] = d_output[output_idx];
+            } else {
+                d_input[input_idx] = 0.0f;
+            }
+        }
+    }
+}
+__global__ void fc_backward(float *d_output, float *weights, float *d_input,
+                           int batch_size, int input_size, int output_size) {
+    int batch_idx = blockIdx.x;
+    int input_idx = threadIdx.x;
+    
+    if (input_idx < input_size) {
+        float sum = 0.0f;
+        for (int j = 0; j < output_size; j++) {
+            sum += d_output[batch_idx * output_size + j] * weights[input_idx * output_size + j];
+        }
+        d_input[batch_idx * input_size + input_idx] = sum;
+    }
+}
+
+__global__ void fc_update_weights(float *input, float *d_output, float *d_weights,
+                                int batch_size, int input_size, int output_size) {
+    int in_idx = blockIdx.x;
+    int out_idx = threadIdx.x;
+    
+    if (in_idx < input_size && out_idx < output_size) {
+        float sum = 0.0f;
+        for (int b = 0; b < batch_size; b++) {
+            sum += input[b * input_size + in_idx] * d_output[b * output_size + out_idx];
+        }
+        d_weights[in_idx * output_size + out_idx] = sum / batch_size;
+    }
+}
+__global__ void relu(float *x, int n) {
+            int idx = blockIdx.x * blockDim.x + threadIdx.x;
+            if (idx < n) {
+                x[idx] = max(0.0, x[idx]);
+            }
+    }
+__global__ void softmax(float *x, int batch_size, int num_classes) {
+            int batch_idx = blockIdx.x; 
+            int class_idx = threadIdx.x; 
+
+            int idx = batch_idx * num_classes + class_idx;
+
+            float max_val = -1e9;
+            for (int j = 0; j < num_classes; j++) {
+                max_val = fmaxf(max_val, x[batch_idx * num_classes + j]);
+            }
+
+            float sum_exp = 0.0;
+            for (int j = 0; j < num_classes; j++) {
+                int current_idx = batch_idx * num_classes + j;
+                x[current_idx] = expf(x[current_idx] - max_val);
+                sum_exp += x[current_idx];
+            }
+
+            x[idx] = x[idx] / sum_exp;
+        }
+
